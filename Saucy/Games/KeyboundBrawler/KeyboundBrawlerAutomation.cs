@@ -55,6 +55,7 @@ internal static unsafe class KeyboundBrawlerAutomation
     private static long   queueDialogueDeadline;
     private static long   queueRetryAt;
     private static long   nextQueueMoveAt;
+    private static long   nextQueueClickAt;
     private static bool   wasInDuty,    roundTracked, resultRecorded;
     private static int    lastMgp = -1, lastMgc = -1;
     private static long   rewardUntil;
@@ -66,6 +67,23 @@ internal static unsafe class KeyboundBrawlerAutomation
 
     internal static void OnUpdate()
     {
+        if (!Svc.ClientState.IsLoggedIn || Svc.Objects.LocalPlayer == null)
+        {
+            Reset();
+            return;
+        }
+
+        if (Svc.Condition[ConditionFlag.BetweenAreas] || Svc.Condition[ConditionFlag.BetweenAreas51])
+        {
+            // Keep the reward baseline through the exit loading screen.
+            pendingEntityId = 0;
+            lastInactivityResetAt = 0;
+            awaitingQueueDialogue = false;
+            StopQueuePath();
+            QueueStatus = "Waiting for area transition";
+            return;
+        }
+
         TickRewards();
         TickAutoQueue();
         TickGameplay();
@@ -79,6 +97,9 @@ internal static unsafe class KeyboundBrawlerAutomation
         lastMgp               = lastMgc      = -1;
         awaitingQueueDialogue = false;
         queueRetryAt          = nextQueueMoveAt = 0;
+        nextQueueClickAt      = 0;
+        pendingWord           = pendingAlternate = "";
+        pendingReadyAt        = rewardUntil = queueDialogueDeadline = 0;
         StopQueuePath();
         QueueStatus = "Looking for entry NPC";
     }
@@ -182,9 +203,14 @@ internal static unsafe class KeyboundBrawlerAutomation
         var hud = agentModule == null
                           ? null
                           : agentModule->GetAgentByInternalId((AgentId)397);
-        if (hud == null)
+        var inputAgent = agentModule == null ? null : agentModule->GetAgentByInternalId((AgentId)398);
+        // These agents must belong to this client's running game. Never fall back to
+        // keyboard injection: another client's foreground window may have focus.
+        if (hud == null || !hud->IsAgentActive() || inputAgent == null ||
+            !inputAgent->IsAgentActive() || *(nint*)((byte*)inputAgent + 0x28) != (nint)hud)
         {
             pendingEntityId = 0;
+            lastInactivityResetAt = 0;
             return;
         }
 
@@ -192,15 +218,7 @@ internal static unsafe class KeyboundBrawlerAutomation
         if (lastInactivityResetAt == 0 || now - lastInactivityResetAt >= 20000)
         {
             lastInactivityResetAt = now;
-            var input = agentModule->GetAgentByInternalId((AgentId)398);
-            if (input != null && *(nint*)((byte*)input + 0x28) == (nint)hud)
-            {
-                *(ulong*)((byte*)input + 0x50) = 0;
-            }
-            else
-            {
-                Svc.Log.Warning("[KeyboundBrawler] Input agent layout was not recognized; inactivity timer was not reset.");
-            }
+            *(ulong*)((byte*)inputAgent + 0x50) = 0;
         }
 
         var words = (StdMap<uint, HudTarget>*)((byte*)hud + 0x28);
@@ -338,21 +356,50 @@ internal static unsafe class KeyboundBrawlerAutomation
 
     private static void TickAutoQueue()
     {
+        if (!C.KeyboundBrawlerAutoQueue)
+        {
+            awaitingQueueDialogue = false;
+            queueRetryAt = nextQueueClickAt = 0;
+            StopQueuePath();
+            QueueStatus = "Auto-queue disabled";
+            return;
+        }
+
+        var now = Environment.TickCount64;
         var result = (AtkUnitBase*)Svc.GameGui.GetAddonByName("KTGResult")
                                       .Address;
         if (result != null && result->IsVisible && AgentHelper.IsAddonOwnedBy(result, AgentId.KTGResult))
         {
+            awaitingQueueDialogue = false;
+            StopQueuePath();
+            if (now < nextQueueClickAt) return;
+            nextQueueClickAt = now + 1000;
+            queueRetryAt = now + 1500;
             QueueStatus = AddonButton.TryClick(result, ResultCloseButtonId)
                                   ? "Closing Brawler result"
                                   : "Waiting for result close button";
             return;
         }
 
-        if (!C.KeyboundBrawlerAutoQueue)
+        // The entry dialog may already be open (including one opened manually).
+        // Handle it before the director/duty checks: those can still be present
+        // during a transition to the next round.
+        var entry = (AtkUnitBase*)Svc.GameGui.GetAddonByName("KTGEnterDialogue").Address;
+        if (entry != null && entry->IsVisible && AgentHelper.IsAddonOwnedBy(entry, AgentId.KTGEnterDialogue))
         {
-            awaitingQueueDialogue = false;
-            queueRetryAt          = 0;
             StopQueuePath();
+            if (now < nextQueueClickAt) return;
+            nextQueueClickAt = now + 1000;
+            if (AddonButton.TryClick(entry, QueueAcceptButtonId))
+            {
+                awaitingQueueDialogue = false;
+                queueRetryAt = now + 30000;
+                QueueStatus = "Entry accepted; waiting for queue";
+            }
+            else
+            {
+                QueueStatus = "Entry button unavailable";
+            }
             return;
         }
 
@@ -368,29 +415,8 @@ internal static unsafe class KeyboundBrawlerAutomation
             return;
         }
 
-        var now = Environment.TickCount64;
         if (awaitingQueueDialogue)
         {
-            var addon = (AtkUnitBase*)Svc.GameGui.GetAddonByName("KTGEnterDialogue")
-                                         .Address;
-            if (addon != null    &&
-                addon->IsVisible &&
-                AgentHelper.IsAddonOwnedBy(addon, AgentId.KTGEnterDialogue))
-            {
-                if (AddonButton.TryClick(addon, QueueAcceptButtonId))
-                {
-                    awaitingQueueDialogue = false;
-                    queueRetryAt          = now + 30000;
-                    QueueStatus           = "Entry accepted; waiting for queue";
-                }
-                else
-                {
-                    QueueStatus = "Entry button unavailable";
-                }
-
-                return;
-            }
-
             if (now < queueDialogueDeadline)
             {
                 QueueStatus = "Waiting for entry dialogue";
@@ -417,6 +443,7 @@ internal static unsafe class KeyboundBrawlerAutomation
 
         if (!Player.Interactable)
         {
+            StopQueuePath();
             QueueStatus = "Waiting until player can interact";
             return;
         }
